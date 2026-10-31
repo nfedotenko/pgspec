@@ -127,6 +127,17 @@ it computes*). The pipeline enforces this with FNV checksums over all
 results on both the profiled-like and the adversarial workload, and the
 builds use `-ffp-contract=off` so FP folding stays IEEE-identical.
 
+## Regime monitoring
+
+A shipped specialization is a bet that the profiled distribution holds.
+The `-DPGSPEC_MONITOR` build (pipeline step 6) counts per-spec guard hits
+and generic fallbacks on the live hot path (~2% overhead measured, zero
+when compiled out). The analyzer embeds the *profiled* generic-path share
+into the generated header (`pgspec::kExpectedMiss`), and the monitor
+flags drift when the live miss-rate exceeds twice the expectation plus
+2pp — on the bimodal profile that's 4.98% live vs 5.00% expected
+(healthy) and 95.8% on the shifted workload (drift flagged, re-profile).
+
 ## Where this goes next (not in the MVP)
 
 - **Probe autogeneration** — probes and the analyzer's site registry are
@@ -141,6 +152,6 @@ builds use `-ffp-contract=off` so FP folding stays IEEE-identical.
   perf/LBR/Intel PT sampling on a shadow instance for production use.
 - **Per-instrument specialization** — key specs by instrument id rather
   than guarding raw field values, with a per-instrument dispatch table.
-- **Regime monitoring** — track guard miss-rate in production; a rising
-  miss-rate (market regime change) should trigger re-profiling, and the
-  fallback path must stay fast, not merely correct.
+- **Continuous re-profiling** — close the loop: a drift signal from the
+  monitor should automatically schedule a re-profile run and a rebuild,
+  and the fallback path must stay fast, not merely correct.
