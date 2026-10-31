@@ -83,7 +83,11 @@ double run_loop(const std::vector<Order>& orders, int reps, uint64_t* checksum) 
     uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
     int64_t position = 0;
 
-    auto step = [&](const Order& o) {
+    // always_inline: with several generated specs the body outgrows the
+    // inliner's threshold, and an outlined lambda forces position and the
+    // accumulators through memory on every order — the store-load of
+    // position lands straight on the serial dependency chain.
+    auto step = [&](const Order& o) __attribute__((always_inline)) {
         Order w = o;
         if constexpr (Chain) w.qty += (uint32_t)((uint64_t)position & 0x3fULL);
         Result res = process_dispatch(w);
