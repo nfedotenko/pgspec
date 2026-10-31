@@ -9,6 +9,7 @@ struct Order {
     uint32_t  lot_size;
     int64_t   price_ticks;
     double    tick_size;
+    uint32_t  instrument;
 };
 
 struct Result {

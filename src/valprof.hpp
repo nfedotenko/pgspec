@@ -28,9 +28,23 @@ struct Key3Hash {
 };
 using Hist3 = std::unordered_map<Key3, uint64_t, Key3Hash>;
 
+struct Key4 {
+    uint64_t a, b, c, d;
+    bool operator==(const Key4&) const = default;
+};
+struct Key4Hash {
+    size_t operator()(const Key4& k) const {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (uint64_t v : {k.a, k.b, k.c, k.d}) { h ^= v; h *= 0x100000001b3ULL; }
+        return (size_t)h;
+    }
+};
+using Hist4 = std::unordered_map<Key4, uint64_t, Key4Hash>;
+
 struct Registry {
     std::map<std::string, Hist> sites;
     std::map<std::string, Hist3> joint_sites;
+    std::map<std::string, Hist4> joint4_sites;
 
     static Registry& get() {
         static Registry r;
@@ -39,6 +53,7 @@ struct Registry {
 
     Hist*  site(const char* name) { return &sites[name]; }
     Hist3* joint(const char* name) { return &joint_sites[name]; }
+    Hist4* joint4(const char* name) { return &joint4_sites[name]; }
 
     void dump(const char* path) {
         FILE* f = std::fopen(path, "w");
@@ -72,6 +87,21 @@ struct Registry {
             }
             std::fprintf(f, "}");
         }
+        for (const auto& [name, hist] : joint4_sites) {
+            if (!first_site) std::fprintf(f, ",\n");
+            first_site = false;
+            std::fprintf(f, "  \"%s\": {", name.c_str());
+            bool first = true;
+            for (const auto& [k, c] : hist) {
+                if (!first) std::fprintf(f, ", ");
+                first = false;
+                std::fprintf(f, "\"%llu|%llu|%llu|%llu\": %llu",
+                             (unsigned long long)k.a, (unsigned long long)k.b,
+                             (unsigned long long)k.c, (unsigned long long)k.d,
+                             (unsigned long long)c);
+            }
+            std::fprintf(f, "}");
+        }
         std::fprintf(f, "\n}\n");
         std::fclose(f);
     }
@@ -97,4 +127,11 @@ struct Registry {
     do {                                                                  \
         static auto* _vp_h = ::valprof::Registry::get().joint(site_name); \
         ++(*_vp_h)[{(uint64_t)(va), (uint64_t)(vb), (uint64_t)(vc)}];     \
+    } while (0)
+
+#define VP_JOINT4(site_name, va, vb, vc, vd)                               \
+    do {                                                                   \
+        static auto* _vp_h = ::valprof::Registry::get().joint4(site_name); \
+        ++(*_vp_h)[{(uint64_t)(va), (uint64_t)(vb), (uint64_t)(vc),        \
+                    (uint64_t)(vd)}];                                      \
     } while (0)

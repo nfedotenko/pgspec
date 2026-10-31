@@ -11,7 +11,7 @@
 
 namespace {
 
-enum class GenMode { Skew, Uniform, Bimodal };
+enum class GenMode { Skew, Uniform, Bimodal, Multi };
 
 std::vector<Order> gen_orders(size_t n, GenMode mode, uint64_t seed) {
     std::mt19937_64 rng(seed);
@@ -22,25 +22,33 @@ std::vector<Order> gen_orders(size_t n, GenMode mode, uint64_t seed) {
     static constexpr uint32_t kLots[]  = {10, 50, 200};
     static constexpr double   kTicks[] = {0.05, 0.25};
 
+    // The hot instrument table for Multi mode: lot and tick are instrument
+    // properties, order type is per-order.
+    static constexpr uint32_t kHotLot[6]  = {100, 10, 50, 200, 25, 500};
+    static constexpr double   kHotTick[6] = {0.01, 0.25, 0.05, 0.10, 0.02, 0.50};
+
     std::vector<Order> v;
     v.reserve(n);
     int  burst_left = 0;
     bool hot_b      = false;
+    int  hot_id     = 0;
     for (size_t i = 0; i < n; ++i) {
         Order o;
         const int r1 = d1000(rng), r2 = d1000(rng), r3 = d1000(rng);
         switch (mode) {
         case GenMode::Skew:
             // The "production" distribution: one dominant value per field.
-            o.type      = (r1 < 990) ? OrderType::Ioc : OrderType(r1 % 3 == 2 ? 3 : r1 % 3);
-            o.lot_size  = (r2 < 970) ? 100u : kLots[r2 % 3];
-            o.tick_size = (r3 < 980) ? 0.01 : kTicks[r3 % 2];
+            o.type       = (r1 < 990) ? OrderType::Ioc : OrderType(r1 % 3 == 2 ? 3 : r1 % 3);
+            o.lot_size   = (r2 < 970) ? 100u : kLots[r2 % 3];
+            o.tick_size  = (r3 < 980) ? 0.01 : kTicks[r3 % 2];
+            o.instrument = (r3 < 980) ? 0u : 1u + (uint32_t)(r1 % 15);
             break;
         case GenMode::Uniform:
             // Adversarial: no dominant value, guards mostly miss.
-            o.type      = OrderType(r1 % 4);
-            o.lot_size  = (r2 % 4 == 0) ? 100u : kLots[r2 % 3];
-            o.tick_size = (r3 % 3 == 0) ? 0.01 : kTicks[r3 % 2];
+            o.type       = OrderType(r1 % 4);
+            o.lot_size   = (r2 % 4 == 0) ? 100u : kLots[r2 % 3];
+            o.tick_size  = (r3 % 3 == 0) ? 0.01 : kTicks[r3 % 2];
+            o.instrument = (uint32_t)(r1 % 16);
             break;
         case GenMode::Bimodal:
             // Two hot instruments with different lot/tick profiles, traded
@@ -52,13 +60,38 @@ std::vector<Order> gen_orders(size_t n, GenMode mode, uint64_t seed) {
             }
             --burst_left;
             if (r3 < 50) {
-                o.type      = OrderType(r1 % 4);
-                o.lot_size  = kLots[r2 % 3];
-                o.tick_size = kTicks[r1 % 2];
+                o.type       = OrderType(r1 % 4);
+                o.lot_size   = kLots[r2 % 3];
+                o.tick_size  = kTicks[r1 % 2];
+                o.instrument = 2u + (uint32_t)(r1 % 14);
             } else if (hot_b) {
                 o.type = OrderType::Ioc; o.lot_size = 10u;  o.tick_size = 0.25;
+                o.instrument = 1u;
             } else {
                 o.type = OrderType::Ioc; o.lot_size = 100u; o.tick_size = 0.01;
+                o.instrument = 0u;
+            }
+            break;
+        case GenMode::Multi:
+            // Six hot instruments with Zipf-ish weights (30/20/15/10/8/7),
+            // traded in bursts, ~5% noise on cold instruments. Lot/tick are
+            // pinned per instrument; type is per-order (95% Ioc).
+            if (burst_left == 0) {
+                hot_id = r1 < 300 ? 0 : r1 < 500 ? 1 : r1 < 650 ? 2
+                       : r1 < 750 ? 3 : r1 < 830 ? 4 : r1 < 900 ? 5 : -1;
+                burst_left = 16 + (r2 % 113);
+            }
+            --burst_left;
+            if (hot_id < 0 || r3 < 50) {
+                o.instrument = 6u + (uint32_t)(r1 % 10);
+                o.type       = OrderType(r1 % 4);
+                o.lot_size   = kLots[r2 % 3];
+                o.tick_size  = kTicks[r1 % 2];
+            } else {
+                o.instrument = (uint32_t)hot_id;
+                o.type       = (r2 < 950) ? OrderType::Ioc : OrderType(r2 % 4);
+                o.lot_size   = kHotLot[hot_id];
+                o.tick_size  = kHotTick[hot_id];
             }
             break;
         }
@@ -92,8 +125,9 @@ double run_loop(const std::vector<Order>& orders, int reps, uint64_t* checksum) 
         VP_U64("order.type:enum", (uint64_t)o.type);
         VP_U64("order.lot_size:u32", o.lot_size);
         VP_F64("order.tick_size:f64", o.tick_size);
-        VP_JOINT3("order.hot:joint", (uint64_t)o.type, o.lot_size,
-                  std::bit_cast<uint64_t>(o.tick_size));
+        VP_U64("order.instrument:u32", o.instrument);
+        VP_JOINT4("order.hot:joint", o.instrument, (uint64_t)o.type,
+                  o.lot_size, std::bit_cast<uint64_t>(o.tick_size));
 #endif
         Order w = o;
         if constexpr (Chain) w.qty += (uint32_t)((uint64_t)position & 0x3fULL);
@@ -106,7 +140,16 @@ double run_loop(const std::vector<Order>& orders, int reps, uint64_t* checksum) 
 
     auto pass = [&]() __attribute__((always_inline)) {
 #if PGSPEC_ENABLED && !defined(FORCE_GENERIC)
-#ifdef PGSPEC_BURST
+#if defined(PGSPEC_INSTR) && defined(PGSPEC_HAS_INSTRUMENT_DISPATCH)
+        // Keyed dispatch: the instrument id picks the spec via a jump
+        // table; its guard only verifies, never searches.
+        for (const Order& o : orders) {
+            if (!pgspec::try_instrument(o, sink)) {
+                PGSPEC_MON_GENERIC();
+                sink(o, GenericSpec{});
+            }
+        }
+#elif defined(PGSPEC_BURST)
         process_stream<pgspec::SpecList>(orders.data(), orders.size(), sink);
 #else
         for (const Order& o : orders) dispatch_one<pgspec::SpecList>(o, sink);
@@ -150,6 +193,7 @@ int main(int argc, char** argv) {
             if      (!strcmp(mode_s, "skew"))    mode = GenMode::Skew;
             else if (!strcmp(mode_s, "uniform")) mode = GenMode::Uniform;
             else if (!strcmp(mode_s, "bimodal")) mode = GenMode::Bimodal;
+            else if (!strcmp(mode_s, "multi"))   mode = GenMode::Multi;
             else { fprintf(stderr, "unknown mode: %s\n", mode_s); return 2; }
         }
         else if (!strcmp(argv[i], "--chain"))                  chain = true;
@@ -172,7 +216,9 @@ int main(int argc, char** argv) {
     printf("RESULT checksum=0x%016" PRIx64 " ns_per_order=%.3f mode=%s chain=%d spec=%s\n",
            checksum, ns_per_order, mode_s, chain ? 1 : 0,
 #if PGSPEC_ENABLED && !defined(FORCE_GENERIC)
-#ifdef PGSPEC_BURST
+#if defined(PGSPEC_INSTR) && defined(PGSPEC_HAS_INSTRUMENT_DISPATCH)
+           "instr"
+#elif defined(PGSPEC_BURST)
            "burst"
 #else
            "order"
