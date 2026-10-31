@@ -28,8 +28,35 @@ generic fallback. Think "what a tracing JIT does", but ahead-of-time.
 Run it:
 
 ```bash
-./pipeline.sh
+./pipeline.sh                                # rule-based proposer
+PROPOSER=llm ./pipeline.sh                   # LLM proposer (needs ANTHROPIC_API_KEY)
+PROPOSER=llm MOCK_RESPONSE=tools/example_proposal.json ./pipeline.sh  # offline test
 ```
+
+## Proposers
+
+Two proposers share one spec contract (guard terms + per-site accessor
+expressions) and one codegen path in `tools/analyze.py`:
+
+- **rule** (default): top-k joint value tuples above `--min-share`, every
+  field pinned to a constant.
+- **llm** (`tools/llm_proposer.py`): Claude (`claude-opus-5-5` by default,
+  `--model` to override) receives the hot-path source and the profile and
+  returns specs as structured JSON (`output_config.format`, so parsing
+  never needs repair). It can propose what the rule can't — e.g. *partial*
+  specialization: pin only `type` for the 99%-IOC tail, keep lot/tick as
+  identity reads. Setup: `python3 -m venv .venv && .venv/bin/pip install
+  anthropic`, export `ANTHROPIC_API_KEY` (the pipeline prefers `.venv`
+  automatically).
+
+Trust boundary: the LLM only *proposes*. Each returned expression must
+tokenize against a strict whitelist (fields of `o`, `OrderType::` enums,
+numeric literals, `std::bit_cast<double>(0x...ULL)`, comparison/arithmetic
+operators — anything else is rejected before codegen); whatever passes is
+then compiled, bit-exactly differential-tested and benchmark-gated like any
+other spec. Any failure — no key, network, refusal, invalid JSON, rejected
+expression — degrades to the rule proposer with a warning. The raw proposal
+is saved to `build/proposal.json` for inspection.
 
 ## What gets specialized
 
@@ -81,6 +108,12 @@ profile; the branchless form brought that to parity. The adversarial
   (0.84x) until the disassembly showed the outlined call. Forced
   inlining restored 1.17x with specs beating the single-spec build.
   A production tool must watch inlining decisions around its codegen.
+- **Partial specialization pays on mixed workloads.** A proposed spec that
+  pins only `type == Ioc` (lot/tick stay runtime reads) made the
+  *adversarial uniform* workload 1.4-1.6x faster while keeping the primary
+  bimodal win: the guard acts as a predictable pre-classifier, splitting
+  one unpredictable 4-way switch into two far more biased paths. The rule
+  proposer cannot express this; the proposer seam can.
 - Consequence of all of the above: the pipeline ends with an
   **accept/reject gate** — a specialization that does not beat baseline
   on the primary workload is reverted. The proposer suggests;
@@ -100,10 +133,10 @@ builds use `-ffp-contract=off` so FP folding stays IEEE-identical.
   hand-written here; C++26 reflection (P2996 + annotations) over marked
   structs should emit both, and generate Spec structs/SoA variants
   directly instead of an external header generator.
-- **LLM proposer** — `tools/analyze.py` marks the seam (`PROPOSER HOOK`):
-  feed histograms + source context to a model that proposes structural
-  transforms (SoA splits, flat maps for dense keys, memoization), all
-  gated by the same differential test.
+- **Richer LLM proposals** — the proposer currently emits specs within the
+  guard/accessor contract; the next step is letting it propose structural
+  transforms (SoA splits, flat maps for dense keys, memoization) through a
+  wider codegen vocabulary, still gated by the same differential test.
 - **Non-intrusive collection** — replace -DVALPROF instrumentation with
   perf/LBR/Intel PT sampling on a shadow instance for production use.
 - **Per-instrument specialization** — key specs by instrument id rather
