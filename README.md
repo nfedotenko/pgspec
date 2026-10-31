@@ -1,0 +1,98 @@
+# pgspec — profile-guided specialization MVP
+
+An offline-JIT experiment: run a binary on a recorded workload, observe
+which *values* dominate at runtime, then regenerate the build so those
+values become compile-time constants on the hot path — guarded, with a
+generic fallback. Think "what a tracing JIT does", but ahead-of-time.
+
+## Pipeline
+
+```
++-------------------+     profile.json      +------------------+
+| engine (-DVALPROF)| --------------------> | tools/analyze.py |
+| value probes on   |   per-site value      | rule-based       |
+| the hot path      |   histograms          | proposer+codegen |
++-------------------+                       +--------+---------+
+                                                     | generated/specialized.hpp
+                                                     v
+                         +--------------------------------------------+
+                         | rebuild:                                   |
+                         |   engine_base  (generic, FORCE_GENERIC)    |
+                         |   engine_spec  (guard -> Spec0 constants)  |
+                         +---------------------+----------------------+
+                                               v
+                          differential test (bit-exact checksums)
+                          + benchmark (skew & adversarial uniform)
+```
+
+Run it:
+
+```bash
+./pipeline.sh
+```
+
+## What gets specialized
+
+The toy hot path (`src/engine.hpp`) is a policy template
+`process_order<Spec>`. `GenericSpec` reads every parameter from the
+order at runtime. The generated `pgspec::Spec0` returns the dominant
+observed values as `constexpr`, so after inlining:
+
+- `qty / lot`, `qty % lot`, `price / lot` — integer division by a
+  runtime value becomes division by a constant (magic-number multiply);
+- the fee `switch` on order type folds away;
+- the tick-size multiply becomes a constant multiply.
+
+`Spec0::guard(o)` checks the assumptions per order; a miss falls back to
+the generic instantiation. The guard is emitted **branchless** (every
+compare materializes as a flag, combined with bitwise `&`, one final
+heavily-biased branch) — a short-circuit `&&` chain compiled to three
+data-dependent branches and cost ~14% on workloads that drift from the
+profile; the branchless form brought that to parity. The adversarial
+`uniform` runs in the pipeline measure exactly that fallback cost.
+
+## Measured findings (Apple M-series)
+
+- **Throughput-bound loops punish this specialization** (0.74x): with
+  independent iterations the OoO core hides `udiv` latency in the
+  otherwise-idle divider unit, while the magic-multiply replacement
+  competes for shared ALU ports and the guard adds work on top.
+- **Latency-bound (stateful) processing rewards it** (~1.17x): the
+  `--chain` mode feeds the running position back into the next order's
+  size — as real engines do via inventory/risk — putting the division on
+  a serial dependency chain where its latency can't be hidden.
+- **The benchmark is part of the product.** Two measurement artifacts
+  produced wrong verdicts before the real one: a serial FNV checksum
+  chain that hid the hot path entirely, and macOS core scheduling
+  (P- vs E-core) that made identical binaries differ by 1.9x between
+  runs. Hence independent accumulators, interleaved runs, min-of-N.
+- Consequence of all of the above: the pipeline ends with an
+  **accept/reject gate** — a specialization that does not beat baseline
+  on the primary workload is reverted. The proposer suggests;
+  measurement decides.
+
+## Correctness contract
+
+The specialized build must produce **bit-identical** results to the
+generic one on any input (guards select *which code path*, never *what
+it computes*). The pipeline enforces this with FNV checksums over all
+results on both the profiled-like and the adversarial workload, and the
+builds use `-ffp-contract=off` so FP folding stays IEEE-identical.
+
+## Where this goes next (not in the MVP)
+
+- **Probe autogeneration** — probes and the analyzer's site registry are
+  hand-written here; C++26 reflection (P2996 + annotations) over marked
+  structs should emit both, and generate Spec structs/SoA variants
+  directly instead of an external header generator.
+- **LLM proposer** — `tools/analyze.py` marks the seam (`PROPOSER HOOK`):
+  feed histograms + source context to a model that proposes structural
+  transforms (SoA splits, flat maps for dense keys, memoization), all
+  gated by the same differential test.
+- **Non-intrusive collection** — replace -DVALPROF instrumentation with
+  perf/LBR/Intel PT sampling on a shadow instance for production use.
+- **Multi-spec dispatch** — top-k specializations (Spec0..SpecN), not
+  just the single dominant tuple; per-instrument specialization.
+- **Regime monitoring** — track guard miss-rate in production; a rising
+  miss-rate (market regime change) should trigger re-profiling, and the
+  fallback path must stay fast, not merely correct.
