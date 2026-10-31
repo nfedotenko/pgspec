@@ -74,9 +74,14 @@ tuple's values as `constexpr`, so after inlining:
 - the fee `switch` on order type folds away;
 - the tick-size multiply becomes a constant multiply.
 
-The generated `SpecList` is tried hottest-first by a compile-time
-dispatch chain (`dispatch_specs` in `engine.hpp`); the first guard that
-holds wins, otherwise the generic instantiation runs. On the bimodal
+The generated `SpecList` is dispatched by one of two strategies, both
+built by the pipeline and judged by the gate per workload: **per-order**
+(`dispatch_one` — the guard cascade runs for every order, hottest-first)
+and **per-burst** (`process_stream` / `dispatch_run`, `-DPGSPEC_BURST` —
+the cascade runs once at the head of an instrument burst, then a
+monomorphic run loop processes the burst with the guard only as its exit
+condition). The first guard that holds wins, otherwise the generic
+instantiation runs. On the bimodal
 workload (two hot instruments traded in bursts) two specs cover ~95% of
 orders and beat both the baseline and the single-spec build. Each guard
 is emitted **branchless** (every
@@ -114,10 +119,20 @@ profile; the branchless form brought that to parity. The adversarial
   bimodal win: the guard acts as a predictable pre-classifier, splitting
   one unpredictable 4-way switch into two far more biased paths. The rule
   proposer cannot express this; the proposer seam can.
+- **Per-burst dispatch without a dispatch key loses** (1.13x vs 1.19x
+  per-order on the primary workload, worse elsewhere): as long as run
+  membership must be verified by evaluating the guard on every order
+  anyway, hoisting the cascade to run heads saves almost nothing and the
+  run bookkeeping costs more than the saved guard checks — a
+  well-predicted branchless cascade is hard to beat. The idea (proposed
+  by the LLM proposer's notes) implicitly assumes a feed-provided
+  dispatch key (instrument id), where the per-order check disappears
+  entirely — that is the per-instrument specialization roadmap item. The
+  gate picked per-order automatically.
 - Consequence of all of the above: the pipeline ends with an
-  **accept/reject gate** — a specialization that does not beat baseline
-  on the primary workload is reverted. The proposer suggests;
-  measurement decides.
+  **accept/reject gate** — a specialization (and now a dispatch
+  strategy) that does not beat the alternatives on the primary workload
+  is not shipped. The proposer suggests; measurement decides.
 
 ## Correctness contract
 
