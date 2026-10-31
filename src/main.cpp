@@ -159,5 +159,30 @@ int main(int argc, char** argv) {
            "off"
 #endif
     );
+
+#if PGSPEC_ENABLED && defined(PGSPEC_MONITOR) && !defined(FORCE_GENERIC)
+    {
+        constexpr size_t n_specs = std::tuple_size_v<pgspec::SpecList>;
+        const auto& g = pgspec_mon::g;
+        uint64_t hit_total = 0;
+        for (size_t i = 0; i < n_specs; ++i) hit_total += g.hits[i];
+        const uint64_t total = hit_total + g.generic;
+        const double miss = total ? (double)g.generic / (double)total : 0.0;
+#ifdef PGSPEC_HAS_EXPECTED_MISS
+        const double expected = pgspec::kExpectedMiss;
+#else
+        const double expected = 0.10;  // no profile expectation in the header
+#endif
+        // Drift rule: the live miss-rate may wander, but 2x the expectation
+        // plus 2pp of slack means the profiled distribution no longer holds.
+        const bool drift = miss > expected * 2.0 + 0.02;
+        printf("MONITOR total=%" PRIu64 " hits=[", total);
+        for (size_t i = 0; i < n_specs; ++i)
+            printf("%s%.2f%%", i ? "," : "",
+                   total ? 100.0 * (double)g.hits[i] / (double)total : 0.0);
+        printf("] generic=%.2f%% miss_rate=%.4f expected_miss=%.4f drift=%d\n",
+               100.0 * miss, miss, expected, drift ? 1 : 0);
+    }
+#endif
     return 0;
 }

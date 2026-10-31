@@ -230,10 +230,12 @@ def propose_rule(profile, min_share, max_specs):
         })
         covered += c
         lines.append(f"- **Spec{len(specs) - 1}** = `{show_tuple(values)}` ({share:.2%})")
+    expected_miss = None
     if specs:
+        expected_miss = 1.0 - covered / total
         lines.append(f"\n**Coverage: {covered / total:.2%} of samples hit a "
                      f"spec; the rest take the generic path.**")
-    return specs, lines
+    return specs, lines, expected_miss
 
 
 def propose_llm(profile, args):
@@ -268,7 +270,10 @@ def propose_llm(profile, args):
                      f"{p.get('rationale', '')}")
     if raw.get("notes"):
         lines.append(f"\n**Proposer notes:** {raw['notes']}")
-    return specs, lines
+    # No expectation: coverage of free-form guards can't be derived from
+    # the joint histogram without evaluating C++; the monitor falls back
+    # to its built-in default.
+    return specs, lines, None
 
 
 def main():
@@ -297,18 +302,25 @@ def main():
     proposer = args.proposer
     if proposer == "llm":
         try:
-            specs, decision_lines = propose_llm(profile, args)
+            specs, decision_lines, expected_miss = propose_llm(profile, args)
         except Exception as e:  # noqa: BLE001 — any LLM failure degrades to rule
             print(f"[analyze] WARNING: llm proposer failed ({e}); "
                   f"falling back to rule proposer", file=sys.stderr)
             proposer = "rule(fallback)"
-            specs, decision_lines = propose_rule(profile, args.min_share, args.max_specs)
+            specs, decision_lines, expected_miss = propose_rule(
+                profile, args.min_share, args.max_specs)
     else:
-        specs, decision_lines = propose_rule(profile, args.min_share, args.max_specs)
+        specs, decision_lines, expected_miss = propose_rule(
+            profile, args.min_share, args.max_specs)
 
     if specs:
         header = HEADER_PRE.format(profile_path=args.profile, proposer=proposer)
         header += "\n".join(emit_spec(i, s) for i, s in enumerate(specs))
+        if expected_miss is not None:
+            header += (f"\n\n// Profiled generic-path share, for the runtime "
+                       f"miss-rate monitor.\n"
+                       f"inline constexpr double kExpectedMiss = {expected_miss:.6f};\n"
+                       f"#define PGSPEC_HAS_EXPECTED_MISS 1")
         header += HEADER_POST.format(
             spec_list=", ".join(f"Spec{i}" for i in range(len(specs))))
     else:
