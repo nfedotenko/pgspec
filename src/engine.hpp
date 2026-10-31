@@ -3,6 +3,7 @@
 
 #include "types.hpp"
 #include "specialized.hpp"
+#include "monitor.hpp"
 
 #ifdef VALPROF
 #include "valprof.hpp"
@@ -59,9 +60,13 @@ template <class SpecTuple, size_t I = 0>
 [[gnu::always_inline]] inline Result dispatch_specs(const Order& o) {
     if constexpr (I < std::tuple_size_v<SpecTuple>) {
         using S = std::tuple_element_t<I, SpecTuple>;
-        if (S::guard(o)) return process_order(o, S{});
+        if (S::guard(o)) {
+            PGSPEC_MON_HIT(I);
+            return process_order(o, S{});
+        }
         return dispatch_specs<SpecTuple, I + 1>(o);
     } else {
+        PGSPEC_MON_GENERIC();
         return process_order(o, GenericSpec{});
     }
 }
