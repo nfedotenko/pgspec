@@ -10,16 +10,17 @@ FLAGS="-std=c++20 -O2 -ffp-contract=off -Isrc -Igenerated"
 ORDERS=${ORDERS:-2000000}
 REPS=${REPS:-25}
 RUNS=${RUNS:-3}
+PROFILE_MODE=${PROFILE_MODE:-bimodal}
 PROFILE_ORDERS=${PROFILE_ORDERS:-1000000}
 
 mkdir -p build
 
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 
-step "1. profiling build + profile collection (skewed 'production' replay)"
+step "1. profiling build + profile collection ($PROFILE_MODE 'production' replay)"
 cp generated/specialized.passthrough.hpp generated/specialized.hpp
 $CXX $FLAGS -DVALPROF -o build/engine_prof src/main.cpp
-./build/engine_prof --mode skew --orders "$PROFILE_ORDERS" --reps 1 \
+./build/engine_prof --mode "$PROFILE_MODE" --orders "$PROFILE_ORDERS" --reps 1 \
     --profile-out build/profile.json > /dev/null
 echo "profile written to build/profile.json"
 
@@ -65,11 +66,11 @@ bench_config() { # label mode extra_flags
         "$(awk -v s="$last_speedup" 'BEGIN{printf "%.2f", s}')"
 }
 
-bench_config "skew / stateful chain"    skew    "--chain"
+bench_config "$PROFILE_MODE / stateful chain" "$PROFILE_MODE" "--chain"
 primary_speedup=$last_speedup
-bench_config "skew / throughput"        skew    ""
-bench_config "uniform / stateful chain" uniform "--chain"
-bench_config "uniform / throughput"     uniform ""
+bench_config "$PROFILE_MODE / throughput"     "$PROFILE_MODE" ""
+bench_config "uniform / stateful chain"       uniform         "--chain"
+bench_config "uniform / throughput"           uniform         ""
 
 echo
 [ "$fail" = 0 ] && echo "differential test: PASS on all 4 workloads ($ORDERS orders x $REPS reps x $RUNS runs)"
@@ -77,7 +78,7 @@ echo
 
 # A specialization that does not beat the baseline on the primary workload
 # must never ship: measurement, not the proposer, has the final word.
-step "5. accept/reject gate (primary: skew / stateful chain, need >= ${GATE:-1.02}x)"
+step "5. accept/reject gate (primary: $PROFILE_MODE / stateful chain, need >= ${GATE:-1.02}x)"
 if awk -v s="$primary_speedup" -v g="${GATE:-1.02}" 'BEGIN{exit !(s >= g)}'; then
     echo "ACCEPTED: specialization kept (${primary_speedup}x on primary workload)"
 else
