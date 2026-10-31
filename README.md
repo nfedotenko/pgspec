@@ -35,16 +35,24 @@ Run it:
 
 The toy hot path (`src/engine.hpp`) is a policy template
 `process_order<Spec>`. `GenericSpec` reads every parameter from the
-order at runtime. The generated `pgspec::Spec0` returns the dominant
-observed values as `constexpr`, so after inlining:
+order at runtime. The analyzer ranks the **joint distribution of value
+tuples** at the dispatch site (marginals are not enough: two fields can
+each look bimodal while only two of their four combinations ever
+co-occur, and a guard is a conjunction) and emits one `SpecN` struct per
+tuple above `--min-share`, up to `--max-specs`. Each spec returns its
+tuple's values as `constexpr`, so after inlining:
 
 - `qty / lot`, `qty % lot`, `price / lot` — integer division by a
   runtime value becomes division by a constant (magic-number multiply);
 - the fee `switch` on order type folds away;
 - the tick-size multiply becomes a constant multiply.
 
-`Spec0::guard(o)` checks the assumptions per order; a miss falls back to
-the generic instantiation. The guard is emitted **branchless** (every
+The generated `SpecList` is tried hottest-first by a compile-time
+dispatch chain (`dispatch_specs` in `engine.hpp`); the first guard that
+holds wins, otherwise the generic instantiation runs. On the bimodal
+workload (two hot instruments traded in bursts) two specs cover ~95% of
+orders and beat both the baseline and the single-spec build. Each guard
+is emitted **branchless** (every
 compare materializes as a flag, combined with bitwise `&`, one final
 heavily-biased branch) — a short-circuit `&&` chain compiled to three
 data-dependent branches and cost ~14% on workloads that drift from the
@@ -66,6 +74,13 @@ profile; the branchless form brought that to parity. The adversarial
   chain that hid the hot path entirely, and macOS core scheduling
   (P- vs E-core) that made identical binaries differ by 1.9x between
   runs. Hence independent accumulators, interleaved runs, min-of-N.
+- **Generated code can push the surrounding code past inliner
+  thresholds.** With two specs the hot-loop lambda stopped being
+  inlined, forcing the running position through a store-load on the
+  serial chain — which looked exactly like "multi-spec doesn't pay"
+  (0.84x) until the disassembly showed the outlined call. Forced
+  inlining restored 1.17x with specs beating the single-spec build.
+  A production tool must watch inlining decisions around its codegen.
 - Consequence of all of the above: the pipeline ends with an
   **accept/reject gate** — a specialization that does not beat baseline
   on the primary workload is reverted. The proposer suggests;
@@ -91,8 +106,8 @@ builds use `-ffp-contract=off` so FP folding stays IEEE-identical.
   gated by the same differential test.
 - **Non-intrusive collection** — replace -DVALPROF instrumentation with
   perf/LBR/Intel PT sampling on a shadow instance for production use.
-- **Multi-spec dispatch** — top-k specializations (Spec0..SpecN), not
-  just the single dominant tuple; per-instrument specialization.
+- **Per-instrument specialization** — key specs by instrument id rather
+  than guarding raw field values, with a per-instrument dispatch table.
 - **Regime monitoring** — track guard miss-rate in production; a rising
   miss-rate (market regime change) should trigger re-profiling, and the
   fallback path must stay fast, not merely correct.
