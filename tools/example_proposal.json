@@ -1,0 +1,45 @@
+{
+  "specs": [
+    {
+      "name": "hot-instrument-a",
+      "rationale": "Dominant joint tuple (Ioc, 100, 0.01) at ~52% of samples; pinning all three fields folds both divisions and the fee switch.",
+      "guard_terms": [
+        "o.type == OrderType::Ioc",
+        "o.lot_size == 100u",
+        "o.tick_size == std::bit_cast<double>(0x3f847ae147ae147bULL)"
+      ],
+      "accessors": {
+        "type": "OrderType::Ioc",
+        "lot_size": "100u",
+        "tick_size": "std::bit_cast<double>(0x3f847ae147ae147bULL)"
+      }
+    },
+    {
+      "name": "hot-instrument-b",
+      "rationale": "Second mode (Ioc, 10, 0.25) at ~43%; together with spec 0 covers ~95% of orders.",
+      "guard_terms": [
+        "o.type == OrderType::Ioc",
+        "o.lot_size == 10u",
+        "o.tick_size == std::bit_cast<double>(0x3fd0000000000000ULL)"
+      ],
+      "accessors": {
+        "type": "OrderType::Ioc",
+        "lot_size": "10u",
+        "tick_size": "std::bit_cast<double>(0x3fd0000000000000ULL)"
+      }
+    },
+    {
+      "name": "ioc-partial",
+      "rationale": "Partial specialization: ~99% of ALL orders are Ioc, so for noise orders missing specs 0-1 we can still fold the fee switch while keeping lot/tick as runtime reads.",
+      "guard_terms": [
+        "o.type == OrderType::Ioc"
+      ],
+      "accessors": {
+        "type": "OrderType::Ioc",
+        "lot_size": "o.lot_size",
+        "tick_size": "o.tick_size"
+      }
+    }
+  ],
+  "notes": "Specs 0-1 cover the two hot instruments; spec 2 catches residual Ioc noise at low value — the benchmark gate should decide whether its extra dispatch branch pays. Next beyond value specialization: hoist the tick multiply into a per-instrument table, and consider splitting Order into hot/cold halves."
+}
