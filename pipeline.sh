@@ -3,6 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Local secrets (e.g. ANTHROPIC_API_KEY for the LLM proposer); gitignored.
+[ -f .env ] && { set -a; . ./.env; set +a; }
+
 CXX=${CXX:-clang++}
 # Project venv (for the LLM proposer's anthropic SDK) wins over system python.
 PY=${PY:-$([ -x .venv/bin/python3 ] && echo .venv/bin/python3 || echo python3)}
