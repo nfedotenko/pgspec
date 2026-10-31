@@ -2,8 +2,8 @@
 #include <tuple>
 
 #include "types.hpp"
+#include "monitor.hpp"   // before specialized.hpp: generated code uses its macros
 #include "specialized.hpp"
-#include "monitor.hpp"
 
 #ifdef VALPROF
 #include "valprof.hpp"

@@ -39,6 +39,12 @@ def _show_f64(v):
 
 
 SITES = {
+    "order.instrument:u32": dict(
+        field="o.instrument",
+        decl=None,  # instrument is a dispatch key, never an accessor
+        fmt=lambda v: f"{v}u",
+        show=lambda v: f"instr{v}",
+    ),
     "order.type:enum": dict(
         field="o.type",
         decl="OrderType type",
@@ -61,9 +67,11 @@ SITES = {
 }
 
 # The joint probe at the dispatch site, its component order, and the
-# accessor-name aliases the LLM proposer uses.
+# accessor-name aliases the LLM proposer uses. The first joint component is
+# the instrument id — a dispatch key, not a specialized value.
 JOINT_SITE = "order.hot:joint"
-JOINT_COMPONENTS = ["order.type:enum", "order.lot_size:u32", "order.tick_size:f64"]
+ACCESSOR_COMPONENTS = ["order.type:enum", "order.lot_size:u32", "order.tick_size:f64"]
+JOINT_COMPONENTS = ["order.instrument:u32"] + ACCESSOR_COMPONENTS
 ACCESSOR_SITES = {
     "type": "order.type:enum",
     "lot_size": "order.lot_size:u32",
@@ -74,7 +82,7 @@ ACCESSOR_SITES = {
 # not tokenize cleanly against this alternation is rejected before codegen.
 ALLOWED_TOKENS = re.compile(r"""
     \s+
-  | o\.(?:type|lot_size|tick_size|qty|price_ticks)\b
+  | o\.(?:type|lot_size|tick_size|qty|price_ticks|instrument)\b
   | OrderType::(?:Limit|Market|Ioc|Fok)\b
   | std::bit_cast<double>
   | 0[xX][0-9a-fA-F]+(?:ULL|uLL|ull)?
@@ -153,7 +161,7 @@ def emit_spec(idx, spec):
     for i, term in enumerate(spec["guard_terms"]):
         guard_lines.append(f"        const unsigned g{i} = (unsigned)({term});")
     conj = " & ".join(f"g{i}" for i in range(len(spec["guard_terms"])))
-    for site in JOINT_COMPONENTS:
+    for site in ACCESSOR_COMPONENTS:
         expr = spec["accessors"][site]
         decl = SITES[site]["decl"]
         # A constant expression folds; an identity read stays runtime.
@@ -187,9 +195,10 @@ def decode_joint(profile):
     return total, sorted(counts.items(), key=lambda kv: -kv[1])
 
 
-def show_tuple(values):
+def show_tuple(values, components=None):
+    components = components or ACCESSOR_COMPONENTS
     return "(" + ", ".join(
-        SITES[s]["show"](v) for s, v in zip(JOINT_COMPONENTS, values)) + ")"
+        SITES[s]["show"](v) for s, v in zip(components, values)) + ")"
 
 
 def profile_report(profile):
@@ -206,36 +215,65 @@ def profile_report(profile):
     total, top = decode_joint(profile)
     if top:
         lines.append(f"## `{JOINT_SITE}`  ({total:,} samples, "
-                     f"{len(top)} distinct tuples)")
-        for values, c in top[:8]:
-            lines.append(f"- `{show_tuple(values)}`: {c:,} ({c / total:.2%})")
+                     f"{len(top)} distinct (instrument, type, lot, tick) tuples)")
+        for values, c in top[:12]:
+            lines.append(f"- `{show_tuple(values, JOINT_COMPONENTS)}`: "
+                         f"{c:,} ({c / total:.2%})")
         lines.append("")
     return lines
 
 
 def propose_rule(profile, min_share, max_specs):
+    """Instrument-grouped top-k: pick each hot instrument's dominant value
+    tuple, dedupe identical tuples into shared specs, and emit both the
+    cascade order (hottest spec first) and the instrument->spec dispatch
+    table for the keyed strategy."""
     total, top = decode_joint(profile)
-    specs, covered, lines = [], 0, []
-    for values, c in top[:max_specs]:
-        share = c / total if total else 0
-        if share < min_share:
+    by_instr = {}
+    for values, c in top:
+        d = by_instr.setdefault(values[0], {"count": 0, "tuples": {}})
+        d["count"] += c
+        d["tuples"][values[1:]] = d["tuples"].get(values[1:], 0) + c
+
+    picked = []  # (instr, tuple, tuple_count, instr_share)
+    for instr, d in sorted(by_instr.items(), key=lambda kv: -kv[1]["count"]):
+        ishare = d["count"] / total if total else 0
+        if ishare < min_share:
             break
+        tup, c = max(d["tuples"].items(), key=lambda kv: kv[1])
+        picked.append((instr, tup, c, ishare))
+
+    # Dedupe tuples into specs, then order specs by aggregated count.
+    tuple_count = {}
+    for _, tup, c, _ in picked:
+        tuple_count[tup] = tuple_count.get(tup, 0) + c
+    ordered = sorted(tuple_count.items(), key=lambda kv: -kv[1])[:max_specs]
+    tuple_idx = {tup: i for i, (tup, _) in enumerate(ordered)}
+
+    specs, lines, covered = [], [], 0
+    for tup, c in ordered:
+        share = c / total if total else 0
         specs.append({
-            "comment": f"{show_tuple(values)}, share {share:.2%}",
+            "comment": f"{show_tuple(tup)}, share {share:.2%}",
             "guard_terms": [
                 f"{SITES[s]['field']} == {SITES[s]['fmt'](v)}"
-                for s, v in zip(JOINT_COMPONENTS, values)],
+                for s, v in zip(ACCESSOR_COMPONENTS, tup)],
             "accessors": {s: SITES[s]["fmt"](v)
-                          for s, v in zip(JOINT_COMPONENTS, values)},
+                          for s, v in zip(ACCESSOR_COMPONENTS, tup)},
         })
         covered += c
-        lines.append(f"- **Spec{len(specs) - 1}** = `{show_tuple(values)}` ({share:.2%})")
+        lines.append(f"- **Spec{len(specs) - 1}** = `{show_tuple(tup)}` ({share:.2%})")
+    instr_cases = sorted(
+        (instr, tuple_idx[tup]) for instr, tup, _, _ in picked if tup in tuple_idx)
+    for instr, idx in instr_cases:
+        lines.append(f"- instrument {instr} -> Spec{idx}")
+
     expected_miss = None
     if specs:
         expected_miss = 1.0 - covered / total
         lines.append(f"\n**Coverage: {covered / total:.2%} of samples hit a "
                      f"spec; the rest take the generic path.**")
-    return specs, lines, expected_miss
+    return specs, lines, expected_miss, instr_cases
 
 
 def propose_llm(profile, args):
@@ -270,10 +308,10 @@ def propose_llm(profile, args):
                      f"{p.get('rationale', '')}")
     if raw.get("notes"):
         lines.append(f"\n**Proposer notes:** {raw['notes']}")
-    # No expectation: coverage of free-form guards can't be derived from
+    # No expectation (coverage of free-form guards can't be derived from
     # the joint histogram without evaluating C++; the monitor falls back
-    # to its built-in default.
-    return specs, lines, None
+    # to its built-in default) and no instrument dispatch table yet.
+    return specs, lines, None, []
 
 
 def main():
@@ -302,15 +340,15 @@ def main():
     proposer = args.proposer
     if proposer == "llm":
         try:
-            specs, decision_lines, expected_miss = propose_llm(profile, args)
+            specs, decision_lines, expected_miss, instr_cases = propose_llm(profile, args)
         except Exception as e:  # noqa: BLE001 — any LLM failure degrades to rule
             print(f"[analyze] WARNING: llm proposer failed ({e}); "
                   f"falling back to rule proposer", file=sys.stderr)
             proposer = "rule(fallback)"
-            specs, decision_lines, expected_miss = propose_rule(
+            specs, decision_lines, expected_miss, instr_cases = propose_rule(
                 profile, args.min_share, args.max_specs)
     else:
-        specs, decision_lines, expected_miss = propose_rule(
+        specs, decision_lines, expected_miss, instr_cases = propose_rule(
             profile, args.min_share, args.max_specs)
 
     if specs:
@@ -321,6 +359,26 @@ def main():
                        f"miss-rate monitor.\n"
                        f"inline constexpr double kExpectedMiss = {expected_miss:.6f};\n"
                        f"#define PGSPEC_HAS_EXPECTED_MISS 1")
+        if instr_cases:
+            case_lines = "\n".join(
+                f"    case {instr}u: if (Spec{idx}::guard(o)) "
+                f"{{ PGSPEC_MON_HIT({idx}); sink(o, Spec{idx}{{}}); return true; }} break;"
+                for instr, idx in instr_cases)
+            header += f"""
+
+// Keyed dispatch: the instrument id picks its spec directly; the guard
+// only VERIFIES the instrument's profiled values (correctness never
+// depends on the id->spec mapping being up to date). Returns false when
+// the order needs the generic path.
+template <class Sink>
+[[gnu::always_inline]] inline bool try_instrument(const Order& o, Sink&& sink) {{
+    switch (o.instrument) {{
+{case_lines}
+    default: break;
+    }}
+    return false;
+}}
+#define PGSPEC_HAS_INSTRUMENT_DISPATCH 1"""
         header += HEADER_POST.format(
             spec_list=", ".join(f"Spec{i}" for i in range(len(specs))))
     else:
