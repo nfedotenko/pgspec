@@ -52,36 +52,72 @@ template <class Spec>
     return r;
 }
 
-// Tries each generated spec in SpecList order (hottest first, as ranked by
-// the analyzer); the first guard that holds wins, otherwise generic.
-// Early returns, not a fold with a result merge: each path tail-returns its
-// own instantiation, so the compiler doesn't build a phi web over Result.
-template <class SpecTuple, size_t I = 0>
-[[gnu::always_inline]] inline Result dispatch_specs(const Order& o) {
+// The caller supplies a sink(order, spec) that owns per-order state updates
+// and result consumption; the dispatchers below only pick the spec. Early
+// returns, not a fold with a result merge, so the compiler doesn't build a
+// phi web over Result.
+
+// Per-order dispatch: tries each generated spec in SpecList order (hottest
+// first, as ranked by the analyzer); the first guard that holds wins.
+template <class SpecTuple, size_t I = 0, class Sink>
+[[gnu::always_inline]] inline void dispatch_one(const Order& o, Sink&& sink) {
     if constexpr (I < std::tuple_size_v<SpecTuple>) {
         using S = std::tuple_element_t<I, SpecTuple>;
         if (S::guard(o)) {
             PGSPEC_MON_HIT(I);
-            return process_order(o, S{});
+            sink(o, S{});
+            return;
         }
-        return dispatch_specs<SpecTuple, I + 1>(o);
+        dispatch_one<SpecTuple, I + 1>(o, sink);
     } else {
         PGSPEC_MON_GENERIC();
-        return process_order(o, GenericSpec{});
+        sink(o, GenericSpec{});
     }
 }
 
-[[gnu::always_inline]] inline Result process_dispatch(const Order& o) {
-#ifdef VALPROF
-    VP_U64("order.type:enum", (uint64_t)o.type);
-    VP_U64("order.lot_size:u32", o.lot_size);
-    VP_F64("order.tick_size:f64", o.tick_size);
-    VP_JOINT3("order.hot:joint", (uint64_t)o.type, o.lot_size,
-              std::bit_cast<uint64_t>(o.tick_size));
-#endif
-#if PGSPEC_ENABLED && !defined(FORCE_GENERIC)
-    return dispatch_specs<pgspec::SpecList>(o);
-#else
-    return process_order(o, GenericSpec{});
-#endif
+template <class SpecTuple, size_t I = 0>
+[[gnu::always_inline]] inline bool any_guard(const Order& o) {
+    if constexpr (I < std::tuple_size_v<SpecTuple>) {
+        return std::tuple_element_t<I, SpecTuple>::guard(o) ||
+               any_guard<SpecTuple, I + 1>(o);
+    } else {
+        return false;
+    }
+}
+
+// Per-burst dispatch: orders arrive in per-instrument bursts, so instead of
+// re-running the guard cascade per order, classify the head of a run and
+// process the whole run through ONE monomorphic loop — the guard survives
+// only as that loop's exit condition (one predictable check per order, and
+// the cascade cost is paid once per run, not once per order).
+template <class SpecTuple, size_t I = 0, class Sink>
+[[gnu::always_inline]] inline size_t dispatch_run(const Order* p, size_t n,
+                                                  Sink&& sink) {
+    if constexpr (I < std::tuple_size_v<SpecTuple>) {
+        using S = std::tuple_element_t<I, SpecTuple>;
+        if (S::guard(p[0])) {
+            size_t i = 0;
+            do {
+                PGSPEC_MON_HIT(I);
+                sink(p[i], S{});
+                ++i;
+            } while (i < n && S::guard(p[i]));
+            return i;
+        }
+        return dispatch_run<SpecTuple, I + 1>(p, n, sink);
+    } else {
+        size_t i = 0;
+        do {
+            PGSPEC_MON_GENERIC();
+            sink(p[i], GenericSpec{});
+            ++i;
+        } while (i < n && !any_guard<SpecTuple>(p[i]));
+        return i;
+    }
+}
+
+template <class SpecTuple, class Sink>
+inline void process_stream(const Order* p, size_t n, Sink&& sink) {
+    size_t i = 0;
+    while (i < n) i += dispatch_run<SpecTuple>(p + i, n - i, sink);
 }

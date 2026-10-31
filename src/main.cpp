@@ -87,22 +87,40 @@ double run_loop(const std::vector<Order>& orders, int reps, uint64_t* checksum) 
     // inliner's threshold, and an outlined lambda forces position and the
     // accumulators through memory on every order — the store-load of
     // position lands straight on the serial dependency chain.
-    auto step = [&](const Order& o) __attribute__((always_inline)) {
+    auto sink = [&](const Order& o, auto spec) __attribute__((always_inline)) {
+#ifdef VALPROF
+        VP_U64("order.type:enum", (uint64_t)o.type);
+        VP_U64("order.lot_size:u32", o.lot_size);
+        VP_F64("order.tick_size:f64", o.tick_size);
+        VP_JOINT3("order.hot:joint", (uint64_t)o.type, o.lot_size,
+                  std::bit_cast<uint64_t>(o.tick_size));
+#endif
         Order w = o;
         if constexpr (Chain) w.qty += (uint32_t)((uint64_t)position & 0x3fULL);
-        Result res = process_dispatch(w);
+        Result res = process_order(w, spec);
         if constexpr (Chain)
             position += (res.odd_qty & 1u) ? (int64_t)res.lots : -(int64_t)res.lots;
         a0 += res.lots; a1 ^= res.odd_qty;
         a2 += (uint64_t)res.notional_milli; a3 ^= (uint64_t)res.fee_micro;
     };
 
+    auto pass = [&]() __attribute__((always_inline)) {
+#if PGSPEC_ENABLED && !defined(FORCE_GENERIC)
+#ifdef PGSPEC_BURST
+        process_stream<pgspec::SpecList>(orders.data(), orders.size(), sink);
+#else
+        for (const Order& o : orders) dispatch_one<pgspec::SpecList>(o, sink);
+#endif
+#else
+        for (const Order& o : orders) sink(o, GenericSpec{});
+#endif
+    };
+
     // Warmup rep (untimed).
-    for (const Order& o : orders) step(o);
+    pass();
 
     const auto t0 = clock::now();
-    for (int r = 0; r < reps; ++r)
-        for (const Order& o : orders) step(o);
+    for (int r = 0; r < reps; ++r) pass();
     const auto t1 = clock::now();
 
     uint64_t c = 0xcbf29ce484222325ULL;
@@ -154,7 +172,11 @@ int main(int argc, char** argv) {
     printf("RESULT checksum=0x%016" PRIx64 " ns_per_order=%.3f mode=%s chain=%d spec=%s\n",
            checksum, ns_per_order, mode_s, chain ? 1 : 0,
 #if PGSPEC_ENABLED && !defined(FORCE_GENERIC)
-           "on"
+#ifdef PGSPEC_BURST
+           "burst"
+#else
+           "order"
+#endif
 #else
            "off"
 #endif
