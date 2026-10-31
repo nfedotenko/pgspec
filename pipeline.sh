@@ -90,4 +90,33 @@ else
     cp generated/specialized.passthrough.hpp generated/specialized.hpp
     $CXX $FLAGS -o build/engine_spec src/main.cpp
     echo "REJECTED: ${primary_speedup}x < ${GATE:-1.02}x — reverted to passthrough, engine_spec rebuilt generic"
+    exit 0  # nothing to monitor
 fi
+
+# A specialization that shipped must notice when production drifts away
+# from the profile it was built from: the monitored build counts guard
+# hits/misses and flags a live miss-rate far above the profiled one.
+step "6. regime monitor (-DPGSPEC_MONITOR build)"
+$CXX $FLAGS -DPGSPEC_MONITOR -o build/engine_mon src/main.cpp
+
+mon_line() { # mode -> the MONITOR line
+    ./build/engine_mon --mode "$1" --chain --orders "$ORDERS" --reps 3 | grep '^MONITOR'
+}
+mon_in=$(mon_line "$PROFILE_MODE")
+mon_out=$(mon_line uniform)
+echo "in-distribution ($PROFILE_MODE): $mon_in"
+echo "drifted (uniform):              $mon_out"
+
+d_in=$(sed -n 's/.*drift=\([01]\).*/\1/p' <<< "$mon_in")
+d_out=$(sed -n 's/.*drift=\([01]\).*/\1/p' <<< "$mon_out")
+if [ "$d_in" = "0" ] && [ "$d_out" = "1" ]; then
+    echo "monitor check: PASS (healthy in-distribution, drift flagged on shifted workload)"
+else
+    echo "monitor check: FAIL (expected drift=0 in-distribution and drift=1 on shifted)"
+    fail=1
+fi
+
+read -r _ ns_plain <<< "$(run_one ./build/engine_spec "$PROFILE_MODE" "--chain")"
+read -r _ ns_mon   <<< "$(run_one ./build/engine_mon  "$PROFILE_MODE" "--chain")"
+echo "monitor overhead on primary workload: ${ns_plain} -> ${ns_mon} ns/order"
+exit "$fail"
