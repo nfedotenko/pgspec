@@ -74,14 +74,17 @@ tuple's values as `constexpr`, so after inlining:
 - the fee `switch` on order type folds away;
 - the tick-size multiply becomes a constant multiply.
 
-The generated `SpecList` is dispatched by one of two strategies, both
+The generated `SpecList` is dispatched by one of three strategies, all
 built by the pipeline and judged by the gate per workload: **per-order**
-(`dispatch_one` — the guard cascade runs for every order, hottest-first)
-and **per-burst** (`process_stream` / `dispatch_run`, `-DPGSPEC_BURST` —
-the cascade runs once at the head of an instrument burst, then a
-monomorphic run loop processes the burst with the guard only as its exit
-condition). The first guard that holds wins, otherwise the generic
-instantiation runs. On the bimodal
+(`dispatch_one` — the guard cascade runs for every order, hottest-first),
+**per-burst** (`process_stream` / `dispatch_run`, `-DPGSPEC_BURST` — the
+cascade runs once at the head of an instrument burst, then a monomorphic
+run loop processes the burst with the guard only as its exit condition)
+and **per-instrument** (`try_instrument`, `-DPGSPEC_INSTR` — a generated
+`switch` on the feed's instrument id jumps straight to that instrument's
+spec, whose guard only *verifies* the profiled values; correctness never
+depends on the id->spec mapping being current). When no guard holds, the
+generic instantiation runs. On the bimodal
 workload (two hot instruments traded in bursts) two specs cover ~95% of
 orders and beat both the baseline and the single-spec build. Each guard
 is emitted **branchless** (every
@@ -127,8 +130,15 @@ profile; the branchless form brought that to parity. The adversarial
   well-predicted branchless cascade is hard to beat. The idea (proposed
   by the LLM proposer's notes) implicitly assumes a feed-provided
   dispatch key (instrument id), where the per-order check disappears
-  entirely — that is the per-instrument specialization roadmap item. The
-  gate picked per-order automatically.
+  entirely. The gate picked per-order automatically.
+- **The dispatch-strategy crossover is a function of spec count, and the
+  gate finds it by measurement.** With a real dispatch key the picture
+  flips as specs multiply: at 2 specs (bimodal) the cascade wins (1.18x;
+  the instrument switch adds nothing), at 6 specs (multi, Zipf-weighted
+  instruments) per-instrument wins (1.10x vs 1.06x on the chain; 11%
+  faster than the cascade on throughput) because the cascade's cost
+  grows with N while the switch stays O(1). Nobody chose the strategy —
+  the gate benchmarks all three per profile.
 - Consequence of all of the above: the pipeline ends with an
   **accept/reject gate** — a specialization (and now a dispatch
   strategy) that does not beat the alternatives on the primary workload
@@ -165,8 +175,9 @@ flags drift when the live miss-rate exceeds twice the expectation plus
   wider codegen vocabulary, still gated by the same differential test.
 - **Non-intrusive collection** — replace -DVALPROF instrumentation with
   perf/LBR/Intel PT sampling on a shadow instance for production use.
-- **Per-instrument specialization** — key specs by instrument id rather
-  than guarding raw field values, with a per-instrument dispatch table.
+- **Instrument-aware LLM proposals** — the LLM proposer sees the
+  instrument column (and `o.instrument` is whitelisted in guards) but
+  does not yet emit the keyed dispatch table; teach it to.
 - **Continuous re-profiling** — close the loop: a drift signal from the
   monitor should automatically schedule a re-profile run and a rebuild,
   and the fallback path must stay fast, not merely correct.
