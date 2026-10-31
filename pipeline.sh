@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 CXX=${CXX:-clang++}
+# Project venv (for the LLM proposer's anthropic SDK) wins over system python.
+PY=${PY:-$([ -x .venv/bin/python3 ] && echo .venv/bin/python3 || echo python3)}
 # -ffp-contract=off keeps FP math bit-identical between the generic and
 # specialized builds, so the differential test can demand exact equality.
 FLAGS="-std=c++20 -O2 -ffp-contract=off -Isrc -Igenerated"
@@ -11,6 +13,7 @@ ORDERS=${ORDERS:-2000000}
 REPS=${REPS:-25}
 RUNS=${RUNS:-3}
 PROFILE_MODE=${PROFILE_MODE:-bimodal}
+PROPOSER=${PROPOSER:-rule}   # rule | llm (llm needs ANTHROPIC_API_KEY; falls back to rule)
 PROFILE_ORDERS=${PROFILE_ORDERS:-1000000}
 
 mkdir -p build
@@ -24,8 +27,10 @@ $CXX $FLAGS -DVALPROF -o build/engine_prof src/main.cpp
     --profile-out build/profile.json > /dev/null
 echo "profile written to build/profile.json"
 
-step "2. analyze profile -> generated/specialized.hpp"
-python3 tools/analyze.py build/profile.json generated/specialized.hpp \
+step "2. analyze profile -> generated/specialized.hpp (proposer: $PROPOSER)"
+"$PY" tools/analyze.py build/profile.json generated/specialized.hpp \
+    --proposer "$PROPOSER" ${MOCK_RESPONSE:+--mock-response "$MOCK_RESPONSE"} \
+    --proposal-out build/proposal.json \
     --report generated/report.md
 
 step "3. build baseline (generic) and specialized binaries"
