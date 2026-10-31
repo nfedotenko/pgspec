@@ -1,4 +1,6 @@
 #pragma once
+#include <tuple>
+
 #include "types.hpp"
 #include "specialized.hpp"
 
@@ -49,15 +51,32 @@ template <class Spec>
     return r;
 }
 
+// Tries each generated spec in SpecList order (hottest first, as ranked by
+// the analyzer); the first guard that holds wins, otherwise generic.
+// Early returns, not a fold with a result merge: each path tail-returns its
+// own instantiation, so the compiler doesn't build a phi web over Result.
+template <class SpecTuple, size_t I = 0>
+[[gnu::always_inline]] inline Result dispatch_specs(const Order& o) {
+    if constexpr (I < std::tuple_size_v<SpecTuple>) {
+        using S = std::tuple_element_t<I, SpecTuple>;
+        if (S::guard(o)) return process_order(o, S{});
+        return dispatch_specs<SpecTuple, I + 1>(o);
+    } else {
+        return process_order(o, GenericSpec{});
+    }
+}
+
 [[gnu::always_inline]] inline Result process_dispatch(const Order& o) {
 #ifdef VALPROF
     VP_U64("order.type:enum", (uint64_t)o.type);
     VP_U64("order.lot_size:u32", o.lot_size);
     VP_F64("order.tick_size:f64", o.tick_size);
+    VP_JOINT3("order.hot:joint", (uint64_t)o.type, o.lot_size,
+              std::bit_cast<uint64_t>(o.tick_size));
 #endif
 #if PGSPEC_ENABLED && !defined(FORCE_GENERIC)
-    if (pgspec::Spec0::guard(o)) [[likely]]
-        return process_order(o, pgspec::Spec0{});
-#endif
+    return dispatch_specs<pgspec::SpecList>(o);
+#else
     return process_order(o, GenericSpec{});
+#endif
 }
